@@ -1,0 +1,1475 @@
+#!/usr/local/bin/python
+
+# ============================================================================
+# This script renders MeFi infodump based heatmaps.
+#
+# To use the script:
+#     * double check and fix globals at top of script to work with your setup
+#     * place un-zipped infodump txt files in a directory
+#     * place the script in the same directory
+#     * run the script from that directory
+#
+# To alter or customize the heat maps being generated edit the main() function
+# at the bottom of the script. Sorry, no command line arg support yet.
+# Hey I wrote this during slow times at work... whaddaya want? :)
+# ============================================================================
+
+# standard modules
+#
+import sys
+import os.path
+import csv
+import pickle
+import locale
+from datetime import datetime
+
+# third party modules
+#
+import numpy as np
+from PIL import Image
+from PIL import ImageFont
+from PIL import ImageDraw
+
+
+# MeFi infodump constants
+#
+CSV_DELIMITER = '\t'
+TIME_FORMAT_STR = '%Y-%m-%d %H:%M:%S.%f'
+FIRST_YEAR = 1999
+LAST_DATE_STR = '2014-02-28 00:00:00.0'
+FIRST_UID = 0
+LAST_UID = 200000
+FIRST_DATA_ROW = 2
+
+# file related constants
+#
+ROOT = '/tmp'
+
+USERS_DATA_FILE = '%s/usernames.txt' % ROOT
+USERS_CACHE_FILE = '%s/usernames.p' % ROOT
+
+MEFI_POST_DATA_FILE = '%s/postdata_mefi.txt' % ROOT
+MEFI_POST_CACHE_FILE = '%s/postdata_mefi.p' % ROOT
+MEFI_COMMENT_DATA_FILE = '%s/commentdata_mefi.txt' % ROOT
+MEFI_COMMENT_CACHE_FILE = '%s/commentdata_mefi.p' % ROOT
+
+META_POST_DATA_FILE = '%s/postdata_meta.txt' % ROOT
+META_POST_CACHE_FILE = '%s/postdata_meta.p' % ROOT
+META_COMMENT_DATA_FILE = '%s/commentdata_meta.txt' % ROOT
+META_COMMENT_CACHE_FILE = '%s/commentdata_meta.p' % ROOT
+
+ASKME_POST_DATA_FILE = '%s/postdata_askme.txt' % ROOT
+ASKME_POST_CACHE_FILE = '%s/postdata_askme.p' % ROOT
+ASKME_COMMENT_DATA_FILE = '%s/commentdata_askme.txt' % ROOT
+ASKME_COMMENT_CACHE_FILE = '%s/commentdata_askme.p' % ROOT
+
+MUSIC_POST_DATA_FILE = '%s/postdata_music.txt' % ROOT
+MUSIC_POST_CACHE_FILE = '%s/postdata_music.p' % ROOT
+MUSIC_COMMENT_DATA_FILE = '%s/commentdata_music.txt' % ROOT
+MUSIC_COMMENT_CACHE_FILE = '%s/commentdata_music.p' % ROOT
+
+# grid related constants
+#
+UIDS_PER_POINT = 1000
+POINTS_PER_TIME_UNIT = 12
+POINTS_PER_UID_UNIT = 10
+
+# pixel image related constants
+#
+PIXELS_PER_POINT = (4,4)
+PADDING = (50, 130, 50, 40) # left, right, top, bottom
+
+# color related constants
+#
+LEGEND_BG_COLOR = (192,192,192)
+LEGEND_FONT_COLOR = (0,0,0)
+FRAME_COLOR = (0,0,0)
+ZERO_COLOR = (96,96,96)
+HEATMAP_COLORS = {'lo':(0,0,0),
+                  'mid':(255,0,0),
+                  'hi':(255,255,0)}
+GRID_COLOR = (128,128,128)
+INTERP_WEIGHT = {'lower':1/2.0, 'upper':(1/4.0)}
+
+# legend, guide and title related constants
+#
+UID_MARKERS = [1000, 2000, 5000, 10000, 15000, 20000, 30000, 40000, 50000, 100000, 150000]
+UNIT_GRID_LINE_WIDTH = (1,1)
+UNIT_LABEL_OFFSET_X_AXIS = (9, 10)
+UNIT_LABEL_OFFSET_Y_AXIS = (-60, -10)
+FONT_FILE = '/usr/share/fonts/liberation/LiberationSans-Bold.ttf'
+FONT_FILE_BOLD = '/usr/share/fonts/liberation/LiberationSans-Bold.ttf'
+FONT12 = ImageFont.truetype(FONT_FILE, 12)
+FONT24B = ImageFont.truetype(FONT_FILE_BOLD, 24)
+UID_LABEL_UNIT_STR = 'k'
+GUIDE_OFFSET = 20
+GUIDE_WIDTH = 35
+GUIDE_HEIGHT = 200
+GUIDE_MARKER_SPACING = 20
+GUIDE_MARKER_LENGTH = 5
+GUIDE_LEGEND_OFFSET = 5
+
+
+def getPointIndexFromDate(dateStr, minYear=FIRST_YEAR):
+    """
+    converts a MeFi infodump time string into a point index.
+    
+    :Parameters:
+        dateStr : `str`
+            date string from an infodump entry
+        minYear : `int` [optional]
+            the year to be associated with a zero index
+            
+    :Returns:
+        the point index for the given dateStr
+        
+    :Rtype:
+        `int`
+    """
+    
+    dt = datetime.strptime(dateStr, TIME_FORMAT_STR)
+    return (dt.year - minYear) * 12 + (dt.month - 1)
+    
+    
+def getPointIndexFromUserID(uid, uidsPerPoint=UIDS_PER_POINT, minUid=FIRST_UID):
+    """
+    converts a MeFi infodump user ID into a point index.
+    
+    :Parameters:
+        uid : `int`
+            user ID from an infodump entry
+        uidsPerPoint : `int` [optional]
+            number of uids per point
+        minUid : `int` [optional]
+            the UID to be associated with zero index
+    
+    :Returns:
+        the point index for the given user ID
+        
+    :Rtype:
+        `int`
+    """
+    
+    return (uid-minUid)/uidsPerPoint
+    
+    
+def getYearAndMonthFromPointIndex(index, minYear=FIRST_YEAR):
+    """
+    converts a point index into a year and month
+    
+    :Parameters:
+        index : `int`
+            point index to convert
+        minYear : `int` [optional]
+            the year to be associated with a zero index
+    """
+    
+    year = minYear + index/12
+    month = index % 12
+    return year, month
+    
+    
+def getUserIDFromPointIndex(index, uidsPerPoint=UIDS_PER_POINT, minUid=FIRST_UID):
+    """
+    converts a point index into a UID
+    
+    :Parameters:
+        index : `int`
+            point index to convert
+        uidsPerPoint : `int` [optional]
+            number of uids per point
+        minUid : `int` [optional]
+            the UID to be associated with zero index
+            
+    :Returns:
+        the base user ID for a given point index
+        
+    :Rtype:
+        `int`
+    """
+    
+    return minUid + index * uidsPerPoint
+    
+    
+def intInterp(value, minValue, maxValue, int1, int2, weight):
+    """
+    interpolates between two integers based on a gievn float value.
+    
+    :Parameters:
+        value : `float`
+            the value for which to interpolate a color
+        minValue : `float`
+            the value mapping to color1
+        maxValue : `float`
+            the value mapping to color2
+        int1 : `int`
+            the integer mapping to minValue
+        int2 : `int`
+            the integer mapping to maxValue
+        weight : `float`
+            weight to apply for nonlinear interpolation (1.0: linear, <1.0 increases fidelity near minValue, >1.0 increases fidelty near maxValue)
+            
+    :Returns:
+        the interpolated integer value
+        
+    :Rtype:
+        `int`
+    """
+    
+    # deal with bad values
+    if np.allclose((maxValue - minValue), 0.0):
+        return int1
+        
+    ratio = (value - minValue)/(maxValue - minValue)
+    weightedRatio = np.clip(np.power(ratio, weight), 0.0, 1.0)
+    result = int1 + (int2 - int1) * weightedRatio
+    return np.clip(result, 0, 255).astype(int)
+    
+    
+def colorInterp(value, minValue, maxValue, color1, color2, weight):
+    """
+    interpolates a color between the given colors based on the given value
+    
+    :Parameters:
+        value : `float`
+            the value for which to interpolate a color
+        minValue : `float`
+            the value mapping to color1
+        maxValue : `float`
+            the value mapping to color2
+        color1 : `tuple(int,int,int)`
+            the color mapping to minValue
+        color2 : `tuple(int,int,int)`
+            the color mapping to maxValue
+        weight : `float`
+            weight to apply for nonlinear interpolation (1.0: linear, <1.0 increases fidelity near minValue, >1.0 increases fidelty near maxValue)
+            
+    :Returns:
+        the interpolated color
+        
+    :Rtype:
+        `tuple(int,int,int)`
+    """
+    
+    return tuple([intInterp(value, minValue, maxValue, color1[i], color2[i], weight) for i in range(3)])
+    
+
+class Data(object):
+    """
+    base class for loading and wrapping MeFi infodump data
+    """
+    
+    def __init__(self, dataFilePath, cacheFilePath, forceReload=False):
+        """
+        creator
+        
+        :Parameters:
+            dataFilePath : `str`
+                the path to the file containing the raw infodump data
+            cacheFilePath : `str`
+                the path to a cache file for pickled pre-processed infodump data
+            forceReload : `bool` [optional]
+                whether or not to reload the data from the raw infodump file instead of the pickled cache (if it exists) 
+        """
+        
+        self._resetData()
+
+        self.forceReload = forceReload
+        self.dataFilePath = dataFilePath
+        self.cacheFilePath = cacheFilePath
+        
+        self.loadData()
+        
+        
+    def _resetData(self):
+        """
+        resets all data for the object
+        """
+        
+        self.data = {}
+        self._subInterval = 0
+        self._mainInterval = 0
+        
+            
+    def loadData(self):
+        """
+        loads data into the object
+        """
+        
+        loadedFromCache = False        
+        if not self.forceReload:
+            if os.path.exists(self.cacheFilePath):
+                self.loadCachedData()
+                loadedFromCache = True
+                
+        if not loadedFromCache:
+            self.loadRawData()
+            self.saveDataCache()
+            
+            
+    def loadRawData(self):
+        """
+        loads raw data from a MeFi infodump file.
+        Must be implemented by derived classes.
+        """
+        
+        raise NotImplementedError('loadRawData() must be implemented by derived classes')
+        
+        
+    def loadCachedData(self):
+        """
+        loads pickled preprocessed data from a cache file
+        """
+        
+        print 'loading infodump data from cache file: "%s"' % self.cacheFilePath
+        
+        if not os.path.exists(self.cacheFilePath):
+            raise ValueError('data cache does not exist at "%s"' % self.cacheFilePath)
+            
+        self.data = pickle.load(open(self.cacheFilePath, 'rb'))
+        
+        
+    def saveDataCache(self):
+        """
+        pickles and saves preprocessed data to a cache file
+        """
+        
+        pickle.dump(self.data, open(self.cacheFilePath, 'wb'))
+        
+    
+    @property
+    def skippedDataEntries(self):
+        """
+        the number of data entries skipped during ingestion
+        
+        :Returns:
+            the number of skipped data entries
+            
+        :Rtype:
+            `int`
+        """
+        
+        return self.data['skippedDataEntries']
+
+
+    def initProgressOutput(self, filePath):
+        """
+        initializes variables for progress output
+        
+        :Parameters:
+            filePath : `str`
+                the file on which to base progress output
+        """
+        
+        lineCount = sum(1 for l in open(filePath)) - FIRST_DATA_ROW
+        self._subInterval = lineCount/100
+        self._mainInterval = lineCount/10
+        if self._subInterval or self._mainInterval:
+            sys.stdout.write('  ')
+        
+        
+    def printProgressOutput(self, i):
+        """
+        prints progress output if applicable
+        
+        :Parameters:
+            i : `int`
+                current count
+        """
+        
+        j = i - FIRST_DATA_ROW
+        
+        if self._mainInterval:
+            if not j%self._mainInterval:
+                v = 10*j/self._mainInterval
+                indent = '  '
+                if v == 100:
+                    indent = ''
+                sys.stdout.write('%s%%\n%s' % ((10*j/self._mainInterval), indent))
+                sys.stdout.flush()
+            elif self._subInterval:
+                if not j%self._subInterval:
+                    sys.stdout.write('.')
+                    sys.stdout.flush()
+            
+        
+        
+class UserData(Data):
+    """
+    class for storing user data from a MeFi infodump
+    """        
+    
+    def __init__(self, dataFilePath=USERS_DATA_FILE, cacheFilePath=USERS_CACHE_FILE, forceReload=False):
+        """
+        creator
+        
+        :Parameters:
+            dataFilePath : `str` [optional]
+                the path to the file containing the raw infodump user data
+            cacheFilePath : `str` [optional]
+                the path to a cache file for pickled pre-processed infodump user data
+            forceReload : `bool` [optional]
+                whether or not to reload the data from the raw infodump file instead of the pickled cache (if it exists) 
+        """
+        
+        super(UserData, self).__init__(dataFilePath, cacheFilePath, forceReload)
+        
+        
+    def _resetData(self):
+        """
+        resets all data for the object
+        """
+        
+        super(UserData, self)._resetData()
+        
+        self.data['userData'] = {}
+        self.data['markerIDs'] = [0 for i in UID_MARKERS]
+        self.data['skippedDataEntries'] = 0
+        
+
+    def loadRawData(self):
+        """
+        loads raw data from a MeFi infodump file.
+        """
+        
+        print 'loading infodump data file: "%s"' % self.dataFilePath
+        
+        self._resetData()
+        
+        self.initProgressOutput(self.dataFilePath)
+        
+        if not os.path.exists(self.dataFilePath):
+            raise ValueError('infodump data does not exist at "%s"' % self.dataFilePath)
+        
+        fp = open(self.dataFilePath, 'r')
+        csvReader = csv.reader(fp, delimiter=CSV_DELIMITER)
+        i = 0
+        for row in csvReader:
+            i += 1
+
+            # no direct access to first data row in the iterator... lame
+            if i <= FIRST_DATA_ROW:
+                continue
+              
+            # progress report  
+            self.printProgressOutput(i)
+            
+            # extract and store user data
+            try:
+                uid = int(row[0])
+                pointIndexByTime = getPointIndexFromDate(row[1])
+                pointIndexByID = getPointIndexFromUserID(uid)
+            except:
+                self.data['_skippedDataEntries'] += 1
+                continue
+            self.data['userData'][uid] = {'t':pointIndexByTime, 'id':pointIndexByID}
+
+            # also store information for inline markers
+            for j in range(len(UID_MARKERS)):
+                if UID_MARKERS[j] > uid:
+                    # haven't reached these markers yet
+                    break
+                if self.data['markerIDs'][j]:
+                    # this marker was already associated with a point index
+                    continue
+                # we have hit the next marker... store it
+                self.data['markerIDs'][j] = pointIndexByTime
+                break
+                
+        fp.close()
+        
+
+    def __contains__(self, item):
+        """
+        magic method used for validating "[not] in" statements.
+        The item is interpreted to be a user ID.
+        
+        :Parameters:
+            item : `int`
+                the user ID to check
+                
+        :Returns:
+            whether ot not the given user ID exists in the data
+            
+        :Rtype:
+            `bool`
+        """
+        
+        return item in self.data['userData']
+        
+        
+    def pointIndexByTime(self, uid):
+        """
+        return the time based point index for the given user ID
+        
+        :Parameters:
+            uid : `int`
+                the user ID to get a time based point index for
+                
+        :Returns:
+            the time based point index for the given user ID
+            
+         :Rtype:
+            `int`
+        """
+        
+        return self.data['userData'][uid]['t']
+        
+        
+    def pointIndexByID(self, uid):
+        """
+        return the ID based point index for the given user ID
+        
+        :Parameters:
+            uid : `int`
+                the user ID to get an ID based point index for
+                
+        :Returns:
+            the ID based point index for the given user ID
+            
+         :Rtype:
+            `int`
+        """
+        
+        return self.data['userData'][uid]['id']
+        
+        
+class PostData(Data):
+    """
+    class for storing post data from a MeFi infodump
+    """        
+    
+    def __init__(self, userData, dataFilePath, cacheFilePath, forceReload=False):
+        """
+        creator
+        
+        :Parameters:
+            userData : `object`
+                the user data to associate post data with
+            dataFilePath : `str` [optional]
+                the path to the file containing the raw infodump post data
+            cacheFilePath : `str` [optional]
+                the path to a cache file for pickled pre-processed infodump post data
+            forceReload : `bool` [optional]
+                whether or not to reload the data from the raw infodump file instead of the pickled cache (if it exists) 
+        """
+        
+        self.userData = userData
+        
+        super(PostData, self).__init__(dataFilePath, cacheFilePath, forceReload)
+        
+        
+    def _resetData(self):
+        """
+        resets all data for the object
+        """
+        
+        super(PostData, self)._resetData()
+        
+        self.data['data'] = {}
+        self.data['skippedDataEntries'] = 0
+        
+
+    def loadRawData(self):
+        """
+        loads raw data from a MeFi infodump file.
+        """
+        
+        print 'loading infodump data file: "%s"' % self.dataFilePath
+
+        self._resetData()
+        
+        self.initProgressOutput(self.dataFilePath)
+
+        if not os.path.exists(self.dataFilePath):
+            raise ValueError('infodump data does not exist at "%s"' % self.dataFilePath)
+        
+        fp = open(self.dataFilePath, 'r')
+        csvReader = csv.reader(fp, delimiter=CSV_DELIMITER)
+        i = 0
+        for row in csvReader:
+            i += 1
+            
+            # no direct access to first data row in the iterator... lame
+            if i <= FIRST_DATA_ROW:
+                continue
+            
+            # progress report  
+            self.printProgressOutput(i)
+            
+            # extract and store post data
+            try:
+                timePointIndex = getPointIndexFromDate(row[2])
+                uid = int(row[1])
+            except:
+                self.data['skippedDataEntries'] += 1
+                continue
+            if not uid in self.userData:
+                self.data['skippedDataEntries'] += 1
+                continue
+            if timePointIndex in self.data['data']:
+                if uid in self.data['data'][timePointIndex]:
+                    self.data['data'][timePointIndex][uid] += 1
+                else:
+                    self.data['data'][timePointIndex][uid] = 1
+            else:
+                self.data['data'][timePointIndex] = {uid:1}
+            
+        fp.close()
+        
+
+    @property
+    def maxIndex(self):
+        """
+        the highest point index in the data
+        
+        :Returns:
+            the highest point index
+            
+        :Rtype:
+            `int`
+        """
+        
+        return np.max(self.data['data'].keys())
+        
+        
+    def userActivityDataAtIndex(self, index):
+        """
+        returns the user activity data at the given index
+        
+        :Returns:
+            user activity data at index
+            
+        :Rtype:
+            `dict`
+        """
+        
+        if index in self.data['data']:
+            return self.data['data'][index]
+            
+        return {}
+            
+            
+class CommentData(Data):
+    """
+    class for storing comment data from a MeFi infodump
+    """        
+    
+    def __init__(self, userData, dataFilePath, cacheFilePath, forceReload=False):
+        """
+        creator
+        
+        :Parameters:
+            userData : `object`
+                the user data to associate comment data with
+            dataFilePath : `str` [optional]
+                the path to the file containing the raw infodump comment data
+            cacheFilePath : `str` [optional]
+                the path to a cache file for pickled pre-processed infodump comment data
+            forceReload : `bool` [optional]
+                whether or not to reload the data from the raw infodump file instead of the pickled cache (if it exists) 
+        """
+        
+        self.userData = userData
+        
+        super(CommentData, self).__init__(dataFilePath, cacheFilePath, forceReload)
+        
+        
+    def _resetData(self):
+        """
+        resets all data for the object
+        """
+        
+        super(CommentData, self)._resetData()
+        
+        self.data['data'] = {}
+        self.data['skippedDataEntries'] = 0
+        
+
+    def loadRawData(self):
+        """
+        loads raw data from a MeFi infodump file.
+        """
+        
+        print 'loading infodump data file: "%s"' % self.dataFilePath
+
+        self._resetData()
+        
+        self.initProgressOutput(self.dataFilePath)
+
+        if not os.path.exists(self.dataFilePath):
+            raise ValueError('infodump data does not exist at "%s"' % self.dataFilePath)
+        
+        fp = open(self.dataFilePath, 'r')
+        csvReader = csv.reader(fp, delimiter=CSV_DELIMITER)
+        i = 0
+        for row in csvReader:
+            i += 1
+            
+            # no direct access to first data row in the iterator... lame
+            if i <= FIRST_DATA_ROW:
+                continue
+            
+            # progress report  
+            self.printProgressOutput(i)
+            
+            # extract and store post data
+            try:
+                timePointIndex = getPointIndexFromDate(row[3])
+                uid = int(row[2])
+            except:
+                self.data['skippedDataEntries'] += 1
+                continue
+            if not uid in self.userData:
+                self.data['skippedDataEntries'] += 1
+                continue
+            if timePointIndex in self.data['data']:
+                if uid in self.data['data'][timePointIndex]:
+                    self.data['data'][timePointIndex][uid] += 1
+                else:
+                    self.data['data'][timePointIndex][uid] = 1
+            else:
+                self.data['data'][timePointIndex] = {uid:1}
+            
+        fp.close()
+        
+        
+    @property
+    def maxIndex(self):
+        """
+        the highest point index in the data
+        
+        :Returns:
+            the highest point index
+            
+        :Rtype:
+            `int`
+        """
+        
+        return np.max(self.data['data'].keys())
+            
+            
+    def userActivityDataAtIndex(self, index):
+        """
+        returns the user activity data at the given index
+        
+        :Returns:
+            user activity data at index
+            
+        :Rtype:
+            `dict`
+        """
+        
+        if index in self.data['data']:
+            return self.data['data'][index]
+            
+        return {}
+            
+            
+class Grid(object):
+    """
+    calculates a grid of values using activity and user data
+    """
+    
+    def __init__(self, userData):
+        """
+        creator
+        
+        :Parameters:
+            userData : `object`
+                object containing user data
+        """
+        
+        self._min = 0
+        self._max = 0
+        self._avg = 0
+        self._med = 0
+        self._rowMin = []
+        self._rowMax = []
+        self._rowMin = []
+        self._rowAvg = []
+        self._rowMed = []
+        self._colMin = []
+        self._colMax = []
+        self._colAvg = []
+        self._colMed = []
+        
+        self.activityData = []
+        self.userData = userData
+        self.userMode = 'uid'
+        self.normalizeMode = 'column'
+        
+        self.grid = []
+        
+        
+    def setModes(self, userMode='uid', normalizeMode='column'):
+        """
+        set the modes for the grid
+        
+        :Parameters:
+            userMode : `str`
+                enum for switching user data between 'time' and 'uid' units along y axis
+            normalizeMode : `str`
+                enum for switching normalizing mode between 'all', 'column', 'row'
+        """
+        
+        if not userMode in ['time','uid']:
+            raise ValueError('invalid userMode value "%s"' % userMode)
+        self.userMode = userMode
+        if not normalizeMode in ['all','column','row','none']:
+            raise ValueError('invalid normalizeMode value "%s"' % normalizeMode)
+        self.normalizeMode = normalizeMode
+        
+    
+    def addActivityData(self, activityData):
+        """
+        add activity data to the grid
+        
+        :Parameters:
+            activityData : `object`
+                object containing activity data
+            userData : `object`
+                object containing user data
+            userMode : `str`
+                enum for switching user data between 'time' and 'uid' units along y axis
+            normalizeMode : `str`
+                enum for switching normalizing mode between 'all', 'column', 'row'
+        """
+        
+        self.activityData.append(activityData)
+
+
+    def updateGrid(self):
+        """
+        update the grid based on current data and mode settings
+        """
+        
+        self.initializeGrid()
+        self.fillGrid()
+        self.normalizeGrid()
+        self.cacheStats()
+        self.cacheUnitCoordinates()
+        
+        
+    def initializeGrid(self):
+        """
+        initializes grid array
+        """
+        
+        xMax = max([ad.maxIndex for ad in self.activityData])
+        yMax = 0
+        if self.userMode == 'time':
+            yMax = getPointIndexFromDate(LAST_DATE_STR)
+        elif self.userMode == 'uid':
+            yMax = getPointIndexFromUserID(LAST_UID)
+        if not (xMax and yMax):
+            raise ValueError('failed to initialize grid with one or more zero sized dimensions (%d x %d)' % (xMax, yMax))
+        
+        self.grid = np.zeros((xMax, yMax))
+        
+        
+    @property
+    def shape(self):
+        """
+        returns the shape of the grid array
+        
+        :Returns:
+            the shape of the grid array
+            
+        :Rtype:
+            `tuple(int, int)`
+        """
+        
+        return self.grid.shape
+        
+        
+    def value(self, x, y):
+        """
+        returns the value at the given grid coordinate
+        
+        :Parameters:
+            x : `int`
+                the x coordinate
+            y : `int`
+                the y coordinate
+                
+        :Returns:
+            the value at the coordinate
+            
+        :Rtype:
+            `float`
+        """
+        
+        return self.grid[x][y]
+        
+        
+    def fillGrid(self):
+        """
+        fills grid with values
+        """
+        
+        for ad in self.activityData:
+            for x in range(self.grid.shape[0]):
+                data = ad.userActivityDataAtIndex(x)
+                for uid in data:
+                    y = -1
+                    if self.userMode == 'time':
+                        y = self.userData.pointIndexByTime(uid)
+                    elif self.userMode == 'uid':
+                        y = self.userData.pointIndexByID(uid)
+                    if y < 0:
+                        raise ValueError('user with ID "%d" does not exist in user data' % uid)
+                    self.grid[x][y] += float(data[uid])
+                
+                
+    def normalizeGrid(self):
+        """
+        normalizes the grid values based on normalization mode
+        """
+        
+        # normalize so each group of values adds up to 1
+        if self.normalizeMode == 'all':
+            self.grid /= np.sum(self.grid)
+        elif self.normalizeMode in ['row', 'column']:
+            if self.normalizeMode == 'row':
+                self.grid = np.swapaxes(self.grid, 0, 1)
+                
+            for x in range(self.grid.shape[0]):
+                self.grid[x] /= np.sum(self.grid[x])
+                
+            if self.normalizeMode == 'row':
+                self.grid = np.swapaxes(self.grid, 0, 1)
+
+        # get rid of NaNs
+        self.grid[np.isnan(self.grid)] = 0.0
+        
+        # normalize the resulting grid values to a range from 0.0 to 1.0
+        self.grid /= np.max(self.grid)
+        
+        
+    def cacheStats(self):
+        """
+        caches the basic stats for the grid.
+        Not using numpy magic here for averages and medians since
+        I'm clipping out zero activity values on purpose. Makes
+        the heat map more readable.
+        """
+        
+        # calculate grid level stats
+        self._min = 0.0
+        self._max = np.max(self.grid)
+        values = [v for col in self.grid for v in col if not np.allclose(v, 0.0)]
+        self._avg = np.average(values)
+        self._med = np.median(values)
+        
+        # calculate column level stats
+        for c in range(self.grid.shape[0]):
+            self._colMin.append(0.0)
+            self._colMax.append(np.max(self.grid[c]))
+            values = [v for v in self.grid[c] if np.allclose(v, 0.0)]
+            self._colAvg.append(np.average(values))
+            self._colMed.append(np.median(values))
+            
+        # calculate row level stats
+        grd = np.swapaxes(self.grid, 0, 1)
+        for r in range(grd.shape[0]):
+            self._rowMin.append(0.0)
+            self._rowMax.append(np.max(grd[r]))
+            values = [v for v in grd[r] if np.allclose(v, 0.0)]
+            self._rowAvg.append(np.average(values))
+            self._rowMed.append(np.median(values))
+            
+            
+    def cacheUnitCoordinates(self):
+        """
+        cache unit coordinates for this grid
+        """
+        
+        self.xUnits = []
+        self.yUnits = []
+        
+        prevYear = None
+        for x in range(self.grid.shape[0]):
+            year, month = getYearAndMonthFromPointIndex(x)
+            if year != prevYear:
+                self.xUnits.append([x, '%d' % year])
+                prevYear = year
+                
+        if self.userMode == 'time':
+            prevYear = None
+            for y in range(self.grid.shape[1]):
+                year, month = getYearAndMonthFromPointIndex(y)
+                if year != prevYear:
+                    self.yUnits.append([y, '%d' % year])
+                    prevYear = year
+        elif self.userMode == 'uid':
+            for y in range(self.grid.shape[1]):
+                if not y%POINTS_PER_UID_UNIT:
+                    labelNum = locale.format('%d', y, grouping=True)
+                    label = '%s%s' % (labelNum, UID_LABEL_UNIT_STR)
+                    self.yUnits.append([y, label])
+                    
+                    
+    @property        
+    def median(self):
+        """
+        returns the median value for the grid
+        
+        :Returns:
+            the median value
+            
+        :Rtype:
+            float
+        """
+        
+        return self._med
+            
+    
+    @property        
+    def average(self):
+        """
+        returns the average value for the grid
+        
+        :Returns:
+            the average value
+            
+        :Rtype:
+            float
+        """
+        
+        return self._avg
+            
+            
+class Renderer(object):
+    """
+    renders grid data into a pixel image
+    """
+    
+    def __init__(self, grid, title, midMode='average'):
+        """
+        creator
+        
+        :Parameters:
+            grid : `object`
+                the grid data to render
+            title : `str`
+                title to be displayed in the image
+            midMode : `str`
+                enum defining how to determine the value to which to map the middle color ('average','median')
+        """
+        
+        self.img = None
+        self.draw = None
+        self.width = 0
+        self.height = 0
+        self.title = title
+        
+        self.grid = grid
+        if not midMode in ['average','median']:
+            raise ValueError('unknown middle mode "%s"' % midMode)
+            
+        self.setMidMode(midMode)
+            
+    
+    def setMidMode(self, midMode):
+        """
+        change the mid mode
+        
+        :Parameters:
+            midMode : `str`
+                enum for the mid mode to be set ('average', 'median')
+        """
+        
+        if not midMode in ['average','median']:
+            raise ValueError('unknown middle mode "%s"' % midMode)
+        self.midMode = midMode
+
+        self.midValue = 0.5
+        if self.midMode == 'average':
+            self.midValue = self.grid.average
+        elif self.midMode == 'median':
+            self.midValue = self.grid.median
+        
+        
+    def render(self, filePath):
+        """
+        renders the heatmap image and saves it to disk
+        
+        :Parameters:
+            filePath : `str`
+                the file path to save the image to
+        """
+        
+        print 'rendering heatmap image for "%s"' % self.title
+
+        self.initializeImage()
+        self.renderGridData()
+        self.renderUnitGrid()
+        self.renderColorGuide()
+        self.renderTitle()
+        self.saveImage(filePath)
+        
+        
+    def getPixelCoordsFromGridPoint(self, x, y):
+        """
+        returns pixel coordinates for the lower left corner of a grid point
+        
+        :Parameters:
+            x : `int`
+                grid point x coordinate
+            y : `int`
+                grid point y coordinate
+        
+        :Returns:   
+            pixel coordinate
+            
+        :Rtype:
+            `tuple(float, float)`
+        """
+        
+        px = np.clip((PADDING[0] + (x * PIXELS_PER_POINT[0])), 0, (self.width - 1))
+        py = np.clip((self.height - (PADDING[3] + (y * PIXELS_PER_POINT[1]))), 0, (self.height - 1))
+        
+        return (px,py)
+        
+        
+    def getPointRectangleFromGridPoint(self, x, y):
+        """
+        returns a list of pixel coordinates for a given gridpoint
+        
+        :Parameters:
+            x : `int`
+                x coordinate of the grid point
+            y : `int`
+                y coordinate of the grid point
+                
+        :Returns:
+            the corners
+            
+        :Rtype:
+            `tuple(tuple(int)`
+        """
+        
+        minX = np.clip((PADDING[0] + (x * PIXELS_PER_POINT[0])), 0, (self.width - 1))
+        maxX = np.clip((minX + (PIXELS_PER_POINT[0] - 1)), minX, (self.width - 1))
+        maxY = np.clip((self.height - (PADDING[3] + (y * PIXELS_PER_POINT[1]))), 0, (self.height - 1))
+        minY = np.clip((maxY - (PIXELS_PER_POINT[1] - 1)), 0, maxY)
+        
+        return ((minX,minY),(maxX,maxY))
+        
+        
+    def getColorFromGridValue(self, value):
+        """
+        returns a color matching the given value
+        
+        :Parameters:
+            value : `float`
+                the value to get a color for
+                
+        :Returns:
+            a color for the given value
+            
+        :Rtype:
+            `tuple(int, int, int)`
+        """
+        
+        # we'll clip true zero values to a distinct color for easier readability
+        if np.allclose(value, 0.0) or value<0.0:
+            return ZERO_COLOR
+            
+        # interpolate color value
+        if value <= self.midValue:
+            return colorInterp(value, 0.0, self.midValue, 
+                               HEATMAP_COLORS['lo'], HEATMAP_COLORS['mid'], 
+                               INTERP_WEIGHT['lower'])
+                               
+        return colorInterp(value, self.midValue, 1.0,
+                           HEATMAP_COLORS['mid'], HEATMAP_COLORS['hi'],
+                           INTERP_WEIGHT['upper'])
+                           
+                           
+    def getLinearColorFromValue(self, value):
+        """
+        returns a color matching the given value
+        
+        :Parameters:
+            value : `float`
+                the value to get a color for
+                
+        :Returns:
+            a color for the given value
+            
+        :Rtype:
+            `tuple(int, int, int)`
+        """
+        
+        if np.allclose(value, 0.0) or value<0.0:
+            return ZERO_COLOR
+        
+        if value <= 0.5:
+            return colorInterp(value, 0.0, 0.5,
+                               HEATMAP_COLORS['lo'], HEATMAP_COLORS['mid'],
+                               1.0)
+        
+        return colorInterp(value, 0.5, 1.0,
+                           HEATMAP_COLORS['mid'], HEATMAP_COLORS['hi'],
+                           1.0)
+
+        
+    def initializeImage(self):
+        """
+        initializes the image object
+        """
+        
+        # get dimensions from grid and convert to pixels
+        shape = self.grid.shape
+        self.width = shape[0] * PIXELS_PER_POINT[0]
+        self.height = shape[1] * PIXELS_PER_POINT[1]
+        
+        # add legend/border space
+        self.width += (PADDING[0] + PADDING[1])
+        self.height += (PADDING[2] + PADDING[3])
+        
+        # initialize image object
+        self.img = Image.new('RGB', (self.width, self.height))
+        self.draw = ImageDraw.Draw(self.img)
+        
+        # draw padding color
+        self.draw.rectangle([(0,0), (self.width,self.height)], fill=LEGEND_BG_COLOR)
+        
+        # draw frame color
+        pad = ((PADDING[0] - 1), (PADDING[1] - 1), (PADDING[2] - 1), (PADDING[3] -1))
+        self.draw.rectangle([(pad[0],pad[2]), ((self.width-pad[1]),(self.height-pad[3]))], fill=FRAME_COLOR)
+        
+        # draw grid background (zero) color
+        self.draw.rectangle([(PADDING[0],PADDING[2]), ((self.width-PADDING[1]),(self.height-PADDING[3]))], fill=ZERO_COLOR)
+        
+        
+    def renderGridData(self):
+        """
+        renders the grid's data into the image object
+        """
+        
+        for x in range(self.grid.shape[0]):
+            for y in range(self.grid.shape[1]):
+                v = self.grid.value(x,y)
+                color = self.getColorFromGridValue(v)
+                rect = self.getPointRectangleFromGridPoint(x,y)
+                self.draw.rectangle([(rect[0][0],rect[0][1]), (rect[1][0],rect[1][1])], fill=color)
+        
+    
+    def renderUnitGrid(self):
+        """
+        renders the unit grid overlay on top of the rendered grid data
+        """
+        
+        xMin = PADDING[0]
+        xMax = self.width-PADDING[1]
+        yMin = self.height-PADDING[3]
+        yMax = PADDING[2]
+        
+        # draw x axis unit grid plus labels
+        for i in range(len(self.grid.xUnits)):
+            label = self.grid.xUnits[i][1]
+            p = self.getPixelCoordsFromGridPoint(self.grid.xUnits[i][0], 0)
+            if i > 0:
+                self.draw.line([(p[0],yMin),(p[0],yMax)], fill=GRID_COLOR, width=UNIT_GRID_LINE_WIDTH[0])
+            if i < len(self.grid.xUnits) - 1:
+                lx = p[0] + UNIT_LABEL_OFFSET_X_AXIS[0]
+                ly = yMin + UNIT_LABEL_OFFSET_X_AXIS[1]
+                self.draw.text((lx,ly), self.grid.xUnits[i][1], LEGEND_FONT_COLOR, font=FONT12)
+            
+        # draw y axis unit grid plus labels
+        for i in range(len(self.grid.yUnits)):
+            label = self.grid.yUnits[i][1]
+            p = self.getPixelCoordsFromGridPoint(0, self.grid.yUnits[i][0])
+            if i > 0:
+                self.draw.line([(xMin,p[1]),(xMax,p[1])], fill=GRID_COLOR, width=UNIT_GRID_LINE_WIDTH[1])
+            tw,th = self.draw.textsize(self.grid.yUnits[i][1], font=FONT12)
+            lx = PADDING[0] - (10 + tw)
+            ly = p[1] + UNIT_LABEL_OFFSET_Y_AXIS[1]
+            self.draw.text((lx,ly), self.grid.yUnits[i][1], LEGEND_FONT_COLOR, font=FONT12)
+                
+        
+    def renderColorGuide(self):
+        """
+        renders a color guide for the heatmap
+        """
+        
+        xMin = self.width - PADDING[1] + GUIDE_OFFSET
+        xMax = xMin + GUIDE_WIDTH
+        yMin = PADDING[2]
+        yMax = PADDING[2] + GUIDE_HEIGHT
+        
+        self.draw.rectangle([(xMin,yMin),(xMax,yMax)], fill=FRAME_COLOR)
+        
+        px1 = xMin + 1
+        px2 = xMax - 1
+        dy = abs(yMax - yMin)
+
+        for y in range(dy):
+            v = float(y)/dy
+            color = self.getLinearColorFromValue(v)
+            py = yMax - y
+            self.draw.line([(px1,py),(px2,py)], fill=color, width=1)
+            
+        for y in range(dy+1):
+            if not y%GUIDE_MARKER_SPACING:
+                px1 = xMax
+                px2 = xMax + GUIDE_MARKER_LENGTH
+                py = yMax - y
+                self.draw.line([(px1,py),(px2,py)], fill=FRAME_COLOR, width=1)
+                
+        tw,th = self.draw.textsize('low', font=FONT12)
+        x = xMax + GUIDE_MARKER_LENGTH + GUIDE_LEGEND_OFFSET
+        y = yMax - th
+        self.draw.text((x,y), 'low', LEGEND_FONT_COLOR, font=FONT12)
+
+        tw,th = self.draw.textsize(self.midMode, font=FONT12)
+        x = xMax + GUIDE_MARKER_LENGTH + GUIDE_LEGEND_OFFSET
+        y = yMin + (yMax-yMin)/2 - th/2
+        self.draw.text((x,y), self.midMode, LEGEND_FONT_COLOR, font=FONT12)
+                
+        tw,th = self.draw.textsize('high', font=FONT12)
+        x = xMax + GUIDE_MARKER_LENGTH + GUIDE_LEGEND_OFFSET
+        y = yMin
+        self.draw.text((x,y), 'high', LEGEND_FONT_COLOR, font=FONT12)
+        
+        
+    def renderTitle(self):
+        """
+        renders title
+        """
+        
+        tw,th = self.draw.textsize(self.title, font=FONT24B)
+        x = (self.width-tw)/2
+        y = (PADDING[2]-th)/2
+        self.draw.text((x,y), self.title, LEGEND_FONT_COLOR, font=FONT24B)
+        
+        
+    def saveImage(self, filePath):
+        """
+        saves the image to the given file path
+        
+        :Parameters:
+            filePath : `str`
+                the file path to save the image to
+        """
+        
+        # save image file
+        print 'saving image file:',filePath
+        self.img.save(filePath, "PNG")
+        
+
+def main():
+    # load user data
+    userData = UserData()
+    
+    # load mefi data
+    mefipData = PostData(userData, MEFI_POST_DATA_FILE, MEFI_POST_CACHE_FILE)
+    meficData = CommentData(userData, MEFI_COMMENT_DATA_FILE, MEFI_COMMENT_CACHE_FILE)
+    
+    # make mefi grids and images
+    mefiUIDGrid = Grid(userData)
+    mefiUIDGrid.addActivityData(mefipData)
+    mefiUIDGrid.updateGrid()
+    mefipUIDRenderer = Renderer(mefiUIDGrid, 'MeFi Posting Activity (by uid over time)')
+    mefipUIDRenderer.render('mefip_by_uid_avg.png')
+    
+    mefiUIDGrid.addActivityData(meficData)
+    # --------------------------------------------------------------------------------
+    # ALT GRID SETTINGS EXAMPLES:
+    #
+    # default normalization is for columns, if per row normalization is desired:
+    #
+    #     mefiUIDGrid.setModes(normalizeMode='row')
+    #
+    # additional modes include 'all' and 'none'
+    #
+    # by default user data/x axis unit is UID, if account opening dates are desired:
+    #
+    #     mefiUIDGrid.setModes(userMode='time')
+    #
+    # or combinations thereof
+    # --------------------------------------------------------------------------------
+    mefiUIDGrid.updateGrid()
+    mefiUIDRenderer = Renderer(mefiUIDGrid, 'MeFi Activity (by uid over time)')
+    # --------------------------------------------------------------------------------
+    # ALT RENDERER SETTINGS EXAMPLES:
+    #
+    # by default the mid value heatmap color is mapped to the average value for the grid
+    # if mapping of the color to the median value for the grid is desired do this:
+    #
+    #     mefiUIDRenderer.setMidMode('median')
+    # --------------------------------------------------------------------------------
+    mefiUIDRenderer.render('mefi_by_uid_avg.png')
+
+    # load meta data
+    metapData = PostData(userData, META_POST_DATA_FILE, META_POST_CACHE_FILE)
+    metacData = CommentData(userData, META_COMMENT_DATA_FILE, META_COMMENT_CACHE_FILE)
+    
+    # make meta grids and images
+    metaUIDGrid = Grid(userData)
+    metaUIDGrid.addActivityData(metapData)
+    metaUIDGrid.updateGrid()
+    metapUIDRenderer = Renderer(metaUIDGrid, 'MeTa Posting Activity (by uid over time)')
+    metapUIDRenderer.render('metap_by_uid_avg.png')
+    
+    metaUIDGrid.addActivityData(metacData)
+    metaUIDGrid.updateGrid()
+    metaUIDRenderer = Renderer(metaUIDGrid, 'MeTa Activity (by uid over time)')
+    metaUIDRenderer.render('meta_by_uid_avg.png')
+
+    # load askme data
+    askmepData = PostData(userData, ASKME_POST_DATA_FILE, ASKME_POST_CACHE_FILE)
+    askmecData = CommentData(userData, ASKME_COMMENT_DATA_FILE, ASKME_COMMENT_CACHE_FILE)
+    
+    # make askme grids and images
+    askmeUIDGrid = Grid(userData)
+    askmeUIDGrid.addActivityData(askmepData)
+    askmeUIDGrid.updateGrid()
+    askmepUIDRenderer = Renderer(askmeUIDGrid, 'AskMe Posting Activity (by uid over time)')
+    askmepUIDRenderer.render('askmep_by_uid_avg.png')
+    
+    askmeUIDGrid.addActivityData(askmecData)
+    askmeUIDGrid.updateGrid()
+    askmeUIDRenderer = Renderer(askmeUIDGrid, 'AskMe Activity (by uid over time)')
+    askmeUIDRenderer.render('askme_by_uid_avg.png')
+
+    # load music data
+    musicpData = PostData(userData, MUSIC_POST_DATA_FILE, MUSIC_POST_CACHE_FILE)
+    musiccData = CommentData(userData, MUSIC_COMMENT_DATA_FILE, MUSIC_COMMENT_CACHE_FILE)
+    
+    # make music grids and images
+    musicUIDGrid = Grid(userData)
+    musicUIDGrid.addActivityData(musicpData)
+    musicUIDGrid.updateGrid()
+    musicpUIDRenderer = Renderer(musicUIDGrid, 'Music Posting Activity (by uid over time)')
+    musicpUIDRenderer.render('musicp_by_uid_avg.png')
+    
+    musicUIDGrid.addActivityData(musiccData)
+    musicUIDGrid.updateGrid()
+    musicUIDRenderer = Renderer(musicUIDGrid, 'Music Activity (by uid over time)')
+    musicUIDRenderer.render('music_by_uid_avg.png')
+    
+    # make cumulative site grids and images
+    allUIDGrid = Grid(userData)
+    allUIDGrid.addActivityData(mefipData)
+    allUIDGrid.addActivityData(askmepData)
+    allUIDGrid.addActivityData(metapData)
+    allUIDGrid.addActivityData(musicpData)
+    allUIDGrid.updateGrid()
+    allpUIDRenderer = Renderer(allUIDGrid, 'All Site Posting Activity (by uid over time)')
+    allpUIDRenderer.render('allp_by_uid_avg.png')
+    
+    allUIDGrid.addActivityData(meficData)
+    allUIDGrid.addActivityData(askmecData)
+    allUIDGrid.addActivityData(metacData)
+    allUIDGrid.addActivityData(musiccData)
+    allUIDGrid.updateGrid()
+    allUIDRenderer = Renderer(allUIDGrid, 'All Site Activity (by uid over time)')
+    allUIDRenderer.render('all_by_uid_avg.png')
+
+
+if __name__ == '__main__':
+    main()
